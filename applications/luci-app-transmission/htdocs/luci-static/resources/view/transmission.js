@@ -2,16 +2,41 @@
 'require view';
 'require fs';
 'require uci';
+'require ui';
 'require rpc';
 'require form';
+'require poll';
 'require tools.widgets as widgets';
 
 var callServiceList = rpc.declare({
 	object: 'service',
 	method: 'list',
 	params: [ 'name' ],
-	expect: { 'transmission': {} }
+	expect: { '': {} }
 });
+
+function getServiceStatus() {
+	return L.resolveDefault(callServiceList('transmission'), {})
+		.then(function (res) {
+			var isRunning = false;
+			try {
+				isRunning = res['transmission']['instances']['instance1']['running'];
+			} catch (e) { }
+			return isRunning;
+		});
+}
+
+function renderStatus(isRunning) {
+	var spanTemp = '<em><span style="color:%s"><strong>%s</strong></span></em>';
+	var renderHTML;
+	if (isRunning) {
+		renderHTML = String.format(spanTemp, 'green', _('Running'));
+	} else {
+		renderHTML = String.format(spanTemp, 'red', _('Not Running'));
+	}
+
+	return renderHTML;
+}
 
 function setFlagBool(o) {
 	o.enabled = 'true';
@@ -19,30 +44,71 @@ function setFlagBool(o) {
 }
 
 return view.extend({
+
+	handleStart: function(m, ev) {
+		return fs.exec('/etc/init.d/transmission', [ 'start' ])
+			.then(L.bind(this.load, this))
+			.then(L.bind(this.render, this))
+			.catch(function(e) { ui.addNotification(null, E('p', e.message)) });
+	},
+
+	handleStop: function(m, ev) {
+		return fs.exec('/etc/init.d/transmission', [ 'stop' ])
+			.then(L.bind(this.load, this))
+			.then(L.bind(this.render, this))
+			.catch(function(e) { ui.addNotification(null, E('p', e.message)) });
+	},
+
 	load: function() {
 		return Promise.all([
 			L.resolveDefault(callServiceList('transmission')),
-			L.resolveDefault(fs.stat('/usr/share/transmission/web/index.html')),
+			L.resolveDefault(fs.stat('/usr/share/transmission/public_html/index.html')),
 			uci.load('transmission')
 		]);
 	},
+
 	render: function(res) {
 		var port = uci.get_first('transmission', 'transmission', 'rpc_port') || '9091';
-
-		var running = Object.keys(res[0].instances || {}).length > 0;
 
 		var webinstalled = res[1] || !!uci.get_first('transmission', 'transmission', 'web_home');
 
 		var button = '';
-		if (running && webinstalled)
+		if (webinstalled)
 			button = '&#160;<a class="btn" href="http://' + window.location.hostname + ':' + port + '" target="_blank" rel="noreferrer noopener">' + _('Open Web Interface') + '</a>';
 
 		var m, s, o;
 
-		m = new form.Map('transmission', 'Transmission', _('Transmission daemon is a simple bittorrent client, here you can configure the settings.') + button);
+		m = new form.Map('transmission', _('Transmission'), _('Transmission daemon is a simple bittorrent client, here you can configure the settings.') + button);
+
+		s = m.section(form.TypedSection);
+		s.anonymous = true;
+		s.render = function () {
+			poll.add(function () {
+				return L.resolveDefault(getServiceStatus()).then(function (res) {
+					var view = document.getElementById("service_status");
+					view.innerHTML = renderStatus(res);
+				});
+			});
+
+			return E('div', { class: 'cbi-section', id: 'status_bar' }, [
+					E('p', { id: 'service_status' }, _('Collecting data...'))
+			]);
+		}
 
 		s = m.section(form.TypedSection, 'transmission', _('Global settings'));
 		s.anonymous = true;
+
+		o = s.option(form.Button, '_start');
+		o.title      = '&#160;';
+		o.inputtitle = _('Start');
+		o.inputstyle = 'save';
+		o.onclick = L.bind(this.handleStart, this, m);
+
+		o = s.option(form.Button, '_stop');
+		o.title      = '&#160;';
+		o.inputtitle = _('Stop');
+		o.inputstyle = 'reset';
+		o.onclick = L.bind(this.handleStop, this, m);
 
 		o = s.option(form.Flag, 'enabled', _('Enabled'));
 		o.rmempty = false;
@@ -51,6 +117,9 @@ return view.extend({
 		o = s.option(widgets.UserSelect, 'user', _('Run daemon as user'));
 		o = s.option(widgets.GroupSelect, 'group', _('Run daemon as group'));
 		o = s.option(form.Value, 'web_home', _('Custom Web UI directory'));
+
+		o = s.option(form.Flag, 'ca_bundle', _('Use system certificates'));
+		o.default = "1";
 
 
 		s = m.section(form.TypedSection, 'transmission', _('Bandwidth settings'));
@@ -97,10 +166,9 @@ return view.extend({
 		s.option(form.Value, 'download_dir', _('Download directory'));
 
 		o = s.option(form.Flag, 'incomplete_dir_enabled', _('Incomplete directory enabled'));
-		setFlagBool(o);
 
 		o = s.option(form.Value, 'incomplete_dir', _('Incomplete directory'));
-		o.depends('incomplete_dir_enabled', 'true');
+		o.depends('incomplete_dir_enabled', '1');
 
 		o = s.option(form.ListValue, 'preallocation', _('Preallocation'));
 		o.value('0', _('Off'));
@@ -119,10 +187,9 @@ return view.extend({
 		o = s.option(form.Value, 'umask', 'umask');
 
 		o = s.option(form.Flag, 'watch_dir_enabled', _('Enable watch directory'));
-		setFlagBool(o);
 
 		o = s.option(form.Value, 'watch_dir', _('Watch directory'));
-		o.depends('watch_dir_enabled', 'true');
+		o.depends('watch_dir_enabled', '1');
 
 
 		s = m.section(form.TypedSection, 'transmission', _('Miscellaneous'));
@@ -271,7 +338,7 @@ return view.extend({
 		s = m.section(form.TypedSection, 'transmission', _('Scheduling'));
 		s.anonymous = true;
 
-		o = s.option(form.Flag, 'alt_speed_time_enabled', _('Alternative speed timing enabled'), _('When enabled, this will toggle the <b>alt-speed-enabled</b> setting'));
+		o = s.option(form.Flag, 'alt_speed_time_enabled', _('Alternative speed timing enabled'));
 		setFlagBool(o);
 
 		o = s.option(form.Value, 'alt_speed_time_begin', _('Alternative speed time begin'), _('in minutes from midnight'));
